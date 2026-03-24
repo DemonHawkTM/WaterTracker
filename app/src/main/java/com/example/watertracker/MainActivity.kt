@@ -47,6 +47,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -126,45 +127,45 @@ class WaterRepository(private val context: Context) {
 fun rescheduleSmartAlarms(context: Context) {
     CoroutineScope(Dispatchers.IO).launch {
         val repo = WaterRepository(context)
-        repo.preferencesFlow.collect { prefs ->
-            val target = prefs[repo.TARGET_KEY] ?: 2000
-            val wakeMins = prefs[repo.WAKE_MINS_KEY] ?: (8 * 60)
-            val sleepMins = prefs[repo.SLEEP_MINS_KEY] ?: (22 * 60)
-            val logs = repo.getTodayLogs(prefs[stringPreferencesKey("water_logs")] ?: "[]")
-            
-            val currentIntake = logs.sumOf { it.amountMl }
-            val remainingTarget = target - currentIntake
+        // FIX: Using .first() grabs the current snapshot without creating a continuous loop
+        val prefs = repo.preferencesFlow.first()
+        
+        val target = prefs[repo.TARGET_KEY] ?: 2000
+        val wakeMins = prefs[repo.WAKE_MINS_KEY] ?: (8 * 60)
+        val sleepMins = prefs[repo.SLEEP_MINS_KEY] ?: (22 * 60)
+        val logs = repo.getTodayLogs(prefs[stringPreferencesKey("water_logs")] ?: "[]")
+        
+        val currentIntake = logs.sumOf { it.amountMl }
+        val remainingTarget = target - currentIntake
 
-            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(context, RescheduleReceiver::class.java)
-            val pendingIntent = PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, RescheduleReceiver::class.java)
+        val pendingIntent = PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
-            // Cancel existing alarm
-            alarmManager.cancel(pendingIntent)
+        // Cancel existing alarm
+        alarmManager.cancel(pendingIntent)
 
-            if (remainingTarget <= 0) return@collect // Goal met, mute alarms
+        if (remainingTarget <= 0) return@launch // Goal met, mute alarms
 
-            val now = Calendar.getInstance()
-            val nowMins = (now.get(Calendar.HOUR_OF_DAY) * 60) + now.get(Calendar.MINUTE)
-            
-            var effectiveSleepMins = sleepMins
-            if (sleepMins <= wakeMins) effectiveSleepMins += (24 * 60)
-            
-            val remainingMinutes = effectiveSleepMins - nowMins
-            if (remainingMinutes <= 0) return@collect // Day is over
+        val now = Calendar.getInstance()
+        val nowMins = (now.get(Calendar.HOUR_OF_DAY) * 60) + now.get(Calendar.MINUTE)
+        
+        var effectiveSleepMins = sleepMins
+        if (sleepMins <= wakeMins) effectiveSleepMins += (24 * 60)
+        
+        val remainingMinutes = effectiveSleepMins - nowMins
+        if (remainingMinutes <= 0) return@launch // Day is over
 
-            val incrementsNeeded = ceil(remainingTarget / 250.0).toInt()
-            if (incrementsNeeded <= 0) return@collect
+        val incrementsNeeded = ceil(remainingTarget / 250.0).toInt()
+        if (incrementsNeeded <= 0) return@launch
 
-            val intervalMillis = (remainingMinutes * 60 * 1000L) / incrementsNeeded
-            
-            alarmManager.setExactAndAllowWhileIdle(
-                AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + intervalMillis,
-                pendingIntent
-            )
-            break // Exit flow collection after scheduling
-        }
+        val intervalMillis = (remainingMinutes * 60 * 1000L) / incrementsNeeded
+        
+        alarmManager.setExactAndAllowWhileIdle(
+            AlarmManager.RTC_WAKEUP,
+            System.currentTimeMillis() + intervalMillis,
+            pendingIntent
+        )
     }
 }
 
@@ -323,7 +324,6 @@ fun HistoryTab(repo: WaterRepository, logs: List<LogEntry>, useOz: Boolean) {
 
 @Composable
 fun ChartTab(allLogs: List<LogEntry>) {
-    // Generate simple weekly bar chart data
     val cal = Calendar.getInstance()
     val dailyTotals = FloatArray(7) { 0f }
     
