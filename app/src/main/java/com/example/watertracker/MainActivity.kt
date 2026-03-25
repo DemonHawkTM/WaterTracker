@@ -556,7 +556,7 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
                         apiVerificationStatus = "Verifying..."
                         coroutineScope.launch {
                             try {
-                                val model = GenerativeModel(modelName = "gemini-1.5-flash", apiKey = apiKey)
+                                val model = GenerativeModel(modelName = "gemini-pro", apiKey = apiKey)
                                 // Send a tiny "ping" prompt to test the key
                                 model.generateContent("Reply with exactly one word: OK")
                                 apiVerificationStatus = "✅ Key is Valid"
