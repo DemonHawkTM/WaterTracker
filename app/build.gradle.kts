@@ -45,4 +45,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.datastore:datastore-preferences:1.0.0")
+    
+    // Google Gemini AI SDK
+    implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
 }
