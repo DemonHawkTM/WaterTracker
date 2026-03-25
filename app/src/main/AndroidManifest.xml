@@ -25,5 +25,17 @@
         <receiver android:name=".DismissReceiver" android:exported="false" />
         <receiver android:name=".RescheduleReceiver" android:exported="false" />
         <receiver android:name=".LogWaterReceiver" android:exported="false" />
+        <receiver android:name=".DismissReceiver" android:exported="false" />
+        <receiver android:name=".RescheduleReceiver" android:exported="false" />
+        <receiver android:name=".LogWaterReceiver" android:exported="false" />
+
+        <receiver android:name=".WaterWidgetProvider" android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_info" />
+        </receiver>
     </application>
 </manifest>
