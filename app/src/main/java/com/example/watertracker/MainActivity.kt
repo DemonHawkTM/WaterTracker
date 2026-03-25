@@ -2,6 +2,7 @@ package com.example.watertracker
 
 import android.Manifest
 import android.app.AlarmManager
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -214,6 +215,7 @@ fun rescheduleSmartAlarms(context: Context) {
     }
 }
 
+// --- Notification Helpers & Receivers ---
 class NotificationHelper(private val context: Context) {
     companion object { const val CHANNEL_ID = "water_channel"; const val NOTIFICATION_ID = 101 }
     fun showWaterNotification() {
@@ -226,15 +228,22 @@ class NotificationHelper(private val context: Context) {
         val dismissIntent = Intent(context, DismissReceiver::class.java)
         val dismissPending = PendingIntent.getBroadcast(context, 3, dismissIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        // The extremely annoying, un-swipeable notification setup
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Hydration Time!")
-            .setContentText("Drink 250ml to stay on track.")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentTitle("Hydration Time! \uD83D\uDCA7")
+            .setContentText("Drink 250ml right now. You CANNOT swipe this away!")
+            .setPriority(NotificationCompat.PRIORITY_MAX) 
+            .setCategory(NotificationCompat.CATEGORY_ALARM) 
             .addAction(android.R.drawable.ic_input_add, "Log 250ml", logPending)
             .setDeleteIntent(dismissPending)
-            .setAutoCancel(true)
-            .build()
+            .setOngoing(true) // Prevents swiping
+            .setAutoCancel(false) // Prevents closing on tap
+        
+        val notification = builder.build()
+        // Make the sound loop continuously until dismissed
+        notification.flags = notification.flags or Notification.FLAG_INSISTENT
+        
         manager.notify(NOTIFICATION_ID, notification)
     }
 }
@@ -264,6 +273,7 @@ class LogWaterReceiver : BroadcastReceiver() {
     }
 }
 
+// --- UI Components ---
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -605,7 +615,7 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
             }
             Spacer(modifier = Modifier.height(32.dp))
             
-            // --- NEW: Test Notification Button ---
+            // --- The Test Notification Button ---
             Button(
                 onClick = { NotificationHelper(context).showWaterNotification() },
                 modifier = Modifier.fillMaxWidth().height(50.dp).padding(bottom = 16.dp),
