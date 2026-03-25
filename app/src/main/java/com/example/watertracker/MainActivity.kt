@@ -475,7 +475,7 @@ fun AIInsightsTab(apiKey: String, allLogs: List<LogEntry>) {
                 isLoading = true
                 coroutineScope.launch {
                     try {
-                        val generativeModel = GenerativeModel(modelName = "gemini-1.5-flash", apiKey = apiKey)
+                        val generativeModel = GenerativeModel(modelName = "gemini-pro", apiKey = apiKey)
                         val totalLogs = allLogs.size
                         val totalVolume = allLogs.sumOf { it.amountMl }
                         val prompt = "You are a hydration expert. I have logged $totalLogs times for a total of $totalVolume ml of water recently. Based on this very brief data, give me a short, encouraging 3-sentence insight about staying hydrated."
