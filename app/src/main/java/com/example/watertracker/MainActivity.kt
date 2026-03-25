@@ -175,7 +175,6 @@ class WaterRepository(private val context: Context) {
 fun rescheduleSmartAlarms(context: Context) {
     CoroutineScope(Dispatchers.IO).launch {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        // Safety Check: Android 14+ requires exact alarm permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) return@launch
 
         val repo = WaterRepository(context)
@@ -250,7 +249,11 @@ class DismissReceiver : BroadcastReceiver() {
         alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 30000, pendingIntent)
     }
 }
-class RescheduleReceiver : BroadcastReceiver() { override fun onReceive(context: Context, intent: Intent) { NotificationHelper(context).showWaterNotification() } }
+
+class RescheduleReceiver : BroadcastReceiver() { 
+    override fun onReceive(context: Context, intent: Intent) { NotificationHelper(context).showWaterNotification() } 
+}
+
 class LogWaterReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         CoroutineScope(Dispatchers.IO).launch {
@@ -276,7 +279,6 @@ fun AppRouter(repo: WaterRepository) {
 
     if (prefs == null) return 
 
-    // Inject Permission Gate before any UI loads
     PermissionGate {
         if (!isSetupComplete) {
             SetupWizardScreen(repo)
@@ -286,7 +288,6 @@ fun AppRouter(repo: WaterRepository) {
     }
 }
 
-// --- NEW: Robust Permission Handling ---
 @Composable
 fun PermissionGate(content: @Composable () -> Unit) {
     val context = LocalContext.current
@@ -336,7 +337,7 @@ fun PermissionGate(content: @Composable () -> Unit) {
             }
         }
     } else {
-        content() // Only show the app if permissions are granted
+        content() 
     }
 }
 
@@ -524,7 +525,6 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
     var useOz by remember { mutableStateOf(prefs?.get(repo.USE_OZ_KEY) ?: false) }
     var isHotWeather by remember { mutableStateOf(prefs?.get(repo.HOT_WEATHER_KEY) ?: false) }
     
-    // NEW: API Verification State
     var apiVerificationStatus by remember { mutableStateOf("") }
     var isVerifying by remember { mutableStateOf(false) }
     
@@ -543,7 +543,6 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
             OutlinedTextField(value = targetVol, onValueChange = { targetVol = it }, label = { Text("Base Target (ml)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
             Spacer(modifier = Modifier.height(16.dp))
             
-            // --- NEW: API Key Input & Verification Button ---
             OutlinedTextField(value = apiKey, onValueChange = { apiKey = it; apiVerificationStatus = "" }, label = { Text("Gemini API Key") }, modifier = Modifier.fillMaxWidth())
             
             Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -557,7 +556,6 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
                         coroutineScope.launch {
                             try {
                                 val model = GenerativeModel(modelName = "gemini-2.5-flash", apiKey = apiKey)
-                                // Send a tiny "ping" prompt to test the key
                                 model.generateContent("Reply with exactly one word: OK")
                                 apiVerificationStatus = "✅ Key is Valid"
                                 repo.saveApiKey(apiKey)
@@ -571,7 +569,6 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
                 ) { Text(if (isVerifying) "..." else "Verify Key") }
             }
             Spacer(modifier = Modifier.height(16.dp))
-            // ------------------------------------------------
 
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFCDD2)), modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -607,6 +604,7 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
                 }
             }
             Spacer(modifier = Modifier.height(32.dp))
+            
             // --- NEW: Test Notification Button ---
             Button(
                 onClick = { NotificationHelper(context).showWaterNotification() },
@@ -615,12 +613,7 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
             ) { 
                 Text("Send Test Notification Now") 
             }
-            // -------------------------------------
-            
-            Button(onClick = {
-                val t = targetVol.toIntOrNull() ?: 2000
-                // ... (rest of your Save Settings logic)
-            
+
             Button(onClick = {
                 val t = targetVol.toIntOrNull() ?: 2000
                 val w = (wakeTime.first * 60) + wakeTime.second
