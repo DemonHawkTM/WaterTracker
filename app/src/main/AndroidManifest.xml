@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.watertracker">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
@@ -25,9 +26,6 @@
         <receiver android:name=".DismissReceiver" android:exported="false" />
         <receiver android:name=".RescheduleReceiver" android:exported="false" />
         <receiver android:name=".LogWaterReceiver" android:exported="false" />
-        <receiver android:name=".DismissReceiver" android:exported="false" />
-        <receiver android:name=".RescheduleReceiver" android:exported="false" />
-        <receiver android:name=".LogWaterReceiver" android:exported="false" />
 
         <receiver android:name=".WaterWidgetProvider" android:exported="true">
             <intent-filter>
@@ -37,5 +35,6 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_info" />
         </receiver>
+
     </application>
 </manifest>
