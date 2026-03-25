@@ -12,8 +12,10 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -41,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
@@ -57,6 +60,7 @@ import org.json.JSONObject
 import java.util.Calendar
 import kotlin.math.ceil
 
+// --- Core Data Structures ---
 data class LogEntry(val id: Long, val timestamp: Long, val amountMl: Int)
 
 val Context.dataStore by preferencesDataStore(name = "water_tracker_prefs")
@@ -69,7 +73,7 @@ class WaterRepository(private val context: Context) {
     val USE_OZ_KEY = booleanPreferencesKey("use_oz")
     val SETUP_COMPLETE_KEY = booleanPreferencesKey("setup_complete")
     val GEMINI_KEY = stringPreferencesKey("gemini_api_key")
-    val HOT_WEATHER_KEY = booleanPreferencesKey("hot_weather_mode") // New Weather Context
+    val HOT_WEATHER_KEY = booleanPreferencesKey("hot_weather_mode")
 
     val preferencesFlow = context.dataStore.data
 
@@ -122,26 +126,22 @@ class WaterRepository(private val context: Context) {
         return deserializeLogs(logsStr).filter { it.timestamp >= startOfDay }
     }
 
-    // Gamification Logic: Calculate consecutive days target was met
     fun calculateStreak(logsStr: String, baseTarget: Int): Int {
         val allLogs = deserializeLogs(logsStr)
         if (allLogs.isEmpty()) return 0
 
         var streak = 0
         val cal = Calendar.getInstance()
-        cal.add(Calendar.DAY_OF_YEAR, -1) // Start checking from yesterday
+        cal.add(Calendar.DAY_OF_YEAR, -1) 
         
         while (true) {
             val startOfDay = cal.apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0) }.timeInMillis
             val endOfDay = startOfDay + (24 * 60 * 60 * 1000)
-            
             val dailyTotal = allLogs.filter { it.timestamp in startOfDay until endOfDay }.sumOf { it.amountMl }
             if (dailyTotal >= baseTarget) {
                 streak++
                 cal.add(Calendar.DAY_OF_YEAR, -1)
-            } else {
-                break
-            }
+            } else { break }
         }
         return streak
     }
@@ -164,8 +164,7 @@ class WaterRepository(private val context: Context) {
     }
     
     private fun updateWidgets(context: Context) {
-        val intent = Intent(context, WaterWidgetProvider::class.java)
-        intent.action = AppWidgetManager.ACTION_APPWIDGET_UPDATE
+        val intent = Intent(context, WaterWidgetProvider::class.java).apply { action = AppWidgetManager.ACTION_APPWIDGET_UPDATE }
         val ids = AppWidgetManager.getInstance(context).getAppWidgetIds(ComponentName(context, WaterWidgetProvider::class.java))
         intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids)
         context.sendBroadcast(intent)
@@ -175,12 +174,16 @@ class WaterRepository(private val context: Context) {
 // --- Smart Scheduling Logic ---
 fun rescheduleSmartAlarms(context: Context) {
     CoroutineScope(Dispatchers.IO).launch {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        // Safety Check: Android 14+ requires exact alarm permission
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) return@launch
+
         val repo = WaterRepository(context)
         val prefs = repo.preferencesFlow.first()
         
         val baseTarget = prefs[repo.TARGET_KEY] ?: 2000
         val isHotWeather = prefs[repo.HOT_WEATHER_KEY] ?: false
-        val target = if (isHotWeather) (baseTarget * 1.15).toInt() else baseTarget // Weather Context applied
+        val target = if (isHotWeather) (baseTarget * 1.15).toInt() else baseTarget
         
         val wakeMins = prefs[repo.WAKE_MINS_KEY] ?: (8 * 60)
         val sleepMins = prefs[repo.SLEEP_MINS_KEY] ?: (22 * 60)
@@ -189,7 +192,6 @@ fun rescheduleSmartAlarms(context: Context) {
         val currentIntake = logs.sumOf { it.amountMl }
         val remainingTarget = target - currentIntake
 
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(context, RescheduleReceiver::class.java)
         val pendingIntent = PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
@@ -241,6 +243,8 @@ class NotificationHelper(private val context: Context) {
 class DismissReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) return
+
         val rescheduleIntent = Intent(context, RescheduleReceiver::class.java)
         val pendingIntent = PendingIntent.getBroadcast(context, 1, rescheduleIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 30000, pendingIntent)
@@ -272,10 +276,67 @@ fun AppRouter(repo: WaterRepository) {
 
     if (prefs == null) return 
 
-    if (!isSetupComplete) {
-        SetupWizardScreen(repo)
+    // Inject Permission Gate before any UI loads
+    PermissionGate {
+        if (!isSetupComplete) {
+            SetupWizardScreen(repo)
+        } else {
+            MainAppScreen(repo, prefs!!)
+        }
+    }
+}
+
+// --- NEW: Robust Permission Handling ---
+@Composable
+fun PermissionGate(content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    
+    var hasNotificationPermission by remember { 
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else true
+        ) 
+    }
+    
+    var hasAlarmPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) alarmManager.canScheduleExactAlarms() else true
+        )
+    }
+
+    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        hasNotificationPermission = isGranted
+    }
+
+    if (!hasNotificationPermission || !hasAlarmPermission) {
+        Column(modifier = Modifier.fillMaxSize().background(Color(0xFFE0E5EC)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(Icons.Default.Warning, contentDescription = "Permissions", tint = Color.DarkGray, modifier = Modifier.size(64.dp))
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("Permissions Required", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("To accurately track and remind you to drink water, this app needs specific permissions.", textAlign = TextAlign.Center, color = Color.Gray)
+            Spacer(modifier = Modifier.height(32.dp))
+
+            if (!hasNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                Button(onClick = { notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Allow Notifications")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+
+            if (!hasAlarmPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                Button(onClick = { 
+                    val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))
+                    context.startActivity(intent)
+                }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Allow Exact Alarms")
+                }
+            }
+        }
     } else {
-        MainAppScreen(repo, prefs!!)
+        content() // Only show the app if permissions are granted
     }
 }
 
@@ -318,7 +379,6 @@ fun SetupWizardScreen(repo: WaterRepository) {
 
 @Composable
 fun MainAppScreen(repo: WaterRepository, prefs: Preferences) {
-    val context = LocalContext.current
     var currentTab by remember { mutableStateOf(0) }
     
     val logsStr = prefs[repo.LOGS_KEY] ?: "[]"
@@ -327,21 +387,12 @@ fun MainAppScreen(repo: WaterRepository, prefs: Preferences) {
     
     val baseTarget = prefs[repo.TARGET_KEY] ?: 2000
     val isHotWeather = prefs[repo.HOT_WEATHER_KEY] ?: false
-    val effectiveTarget = if (isHotWeather) (baseTarget * 1.15).toInt() else baseTarget // Weather logic applied
+    val effectiveTarget = if (isHotWeather) (baseTarget * 1.15).toInt() else baseTarget
 
     val useOz = prefs[repo.USE_OZ_KEY] ?: false
     val apiKey = prefs[repo.GEMINI_KEY] ?: ""
     val currentIntake = todayLogs.sumOf { it.amountMl }
     val currentStreak = repo.calculateStreak(logsStr, baseTarget)
-
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-    }
 
     Scaffold(
         bottomBar = {
@@ -372,8 +423,6 @@ fun HomeTab(repo: WaterRepository, currentIntake: Int, target: Int, useOz: Boole
     val unit = if (useOz) "oz" else "ml"
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        
-        // Gamification & Weather Indicators
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE0B2))) {
                 Text("🔥 $streak Day Streak", modifier = Modifier.padding(8.dp), fontWeight = FontWeight.Bold)
@@ -384,7 +433,6 @@ fun HomeTab(repo: WaterRepository, currentIntake: Int, target: Int, useOz: Boole
                 }
             }
         }
-        
         Spacer(modifier = Modifier.height(40.dp))
 
         Box(modifier = Modifier.size(250.dp).shadow(12.dp, RoundedCornerShape(150.dp)).background(Color(0xFFE0E5EC), RoundedCornerShape(150.dp)), contentAlignment = Alignment.Center) {
@@ -476,6 +524,10 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
     var useOz by remember { mutableStateOf(prefs?.get(repo.USE_OZ_KEY) ?: false) }
     var isHotWeather by remember { mutableStateOf(prefs?.get(repo.HOT_WEATHER_KEY) ?: false) }
     
+    // NEW: API Verification State
+    var apiVerificationStatus by remember { mutableStateOf("") }
+    var isVerifying by remember { mutableStateOf(false) }
+    
     val wakeMins = prefs?.get(repo.WAKE_MINS_KEY) ?: 480
     var wakeTime by remember { mutableStateOf(Pair(wakeMins / 60, wakeMins % 60)) }
     
@@ -491,9 +543,35 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
             OutlinedTextField(value = targetVol, onValueChange = { targetVol = it }, label = { Text("Base Target (ml)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
             Spacer(modifier = Modifier.height(16.dp))
             
-            OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, label = { Text("Gemini API Key") }, modifier = Modifier.fillMaxWidth())
-            Text("Required for AI Insights.", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
+            // --- NEW: API Key Input & Verification Button ---
+            OutlinedTextField(value = apiKey, onValueChange = { apiKey = it; apiVerificationStatus = "" }, label = { Text("Gemini API Key") }, modifier = Modifier.fillMaxWidth())
+            
+            Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(apiVerificationStatus, fontSize = 12.sp, color = if (apiVerificationStatus.contains("Invalid")) Color.Red else Color(0xFF4A90E2), modifier = Modifier.weight(1f))
+                
+                Button(
+                    enabled = apiKey.isNotBlank() && !isVerifying,
+                    onClick = {
+                        isVerifying = true
+                        apiVerificationStatus = "Verifying..."
+                        coroutineScope.launch {
+                            try {
+                                val model = GenerativeModel(modelName = "gemini-1.5-flash", apiKey = apiKey)
+                                // Send a tiny "ping" prompt to test the key
+                                model.generateContent("Reply with exactly one word: OK")
+                                apiVerificationStatus = "✅ Key is Valid"
+                                repo.saveApiKey(apiKey)
+                            } catch (e: Exception) {
+                                apiVerificationStatus = "❌ Invalid Key: ${e.localizedMessage}"
+                            } finally {
+                                isVerifying = false
+                            }
+                        }
+                    }
+                ) { Text(if (isVerifying) "..." else "Verify Key") }
+            }
             Spacer(modifier = Modifier.height(16.dp))
+            // ------------------------------------------------
 
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFCDD2)), modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
