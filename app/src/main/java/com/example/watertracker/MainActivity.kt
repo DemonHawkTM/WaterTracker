@@ -607,6 +607,19 @@ fun SettingsTab(repo: WaterRepository, prefs: Preferences?) {
                 }
             }
             Spacer(modifier = Modifier.height(32.dp))
+            // --- NEW: Test Notification Button ---
+            Button(
+                onClick = { NotificationHelper(context).showWaterNotification() },
+                modifier = Modifier.fillMaxWidth().height(50.dp).padding(bottom = 16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+            ) { 
+                Text("Send Test Notification Now") 
+            }
+            // -------------------------------------
+            
+            Button(onClick = {
+                val t = targetVol.toIntOrNull() ?: 2000
+                // ... (rest of your Save Settings logic)
             
             Button(onClick = {
                 val t = targetVol.toIntOrNull() ?: 2000
