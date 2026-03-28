@@ -35,6 +35,11 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_info" />
         </receiver>
+        <receiver android:name=".DismissReceiver" android:exported="false" />
+        <receiver android:name=".RescheduleReceiver" android:exported="false" />
+        <receiver android:name=".LogWaterReceiver" android:exported="false" />
+        <receiver android:name=".NagReceiver" android:exported="false" />
+        <receiver android:name=".SnoozeReceiver" android:exported="false" />
 
     </application>
 </manifest>
