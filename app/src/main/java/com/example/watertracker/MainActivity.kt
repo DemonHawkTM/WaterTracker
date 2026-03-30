@@ -2,6 +2,7 @@ package com.example.watertracker
 
 import android.Manifest
 import android.app.AlarmManager
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -73,7 +74,7 @@ class WaterRepository(private val context: Context) {
     val SETUP_COMPLETE_KEY = booleanPreferencesKey("setup_complete")
     val GEMINI_KEY = stringPreferencesKey("gemini_api_key")
     val HOT_WEATHER_KEY = booleanPreferencesKey("hot_weather_mode")
-    val NEXT_ALARM_KEY = longPreferencesKey("next_alarm_time") // NEW: Tracks the next scheduled glass
+    val NEXT_ALARM_KEY = longPreferencesKey("next_alarm_time")
 
     val preferencesFlow = context.dataStore.data
 
@@ -84,9 +85,7 @@ class WaterRepository(private val context: Context) {
             prefs[LOGS_KEY] = serializeLogs(logs)
         }
         
-        // NEW: Instantly clear notifications and nag loops on log
         NotificationHelper.clearAll(context)
-        
         rescheduleSmartAlarms(context)
         updateWidgets(context)
     }
@@ -123,7 +122,7 @@ class WaterRepository(private val context: Context) {
     }
 
     fun getTodayLogs(logsStr: String): List<LogEntry> {
-        val startOfDay = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0) }.timeInMillis
+        val startOfDay = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0) }.timeInMillis
         return deserializeLogs(logsStr).filter { it.timestamp >= startOfDay }
     }
 
@@ -134,7 +133,7 @@ class WaterRepository(private val context: Context) {
         val cal = Calendar.getInstance()
         cal.add(Calendar.DAY_OF_YEAR, -1) 
         while (true) {
-            val startOfDay = cal.apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0) }.timeInMillis
+            val startOfDay = cal.apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0) }.timeInMillis
             val endOfDay = startOfDay + (24 * 60 * 60 * 1000)
             val dailyTotal = allLogs.filter { it.timestamp in startOfDay until endOfDay }.sumOf { it.amountMl }
             if (dailyTotal >= baseTarget) { streak++; cal.add(Calendar.DAY_OF_YEAR, -1) } else { break }
@@ -167,7 +166,7 @@ class WaterRepository(private val context: Context) {
     }
 }
 
-// --- Smart Scheduling Logic ---
+// --- NEW: Bulletproof Smart Scheduling Logic ---
 fun rescheduleSmartAlarms(context: Context) {
     CoroutineScope(Dispatchers.IO).launch {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -189,81 +188,88 @@ fun rescheduleSmartAlarms(context: Context) {
 
         val intent = Intent(context, RescheduleReceiver::class.java)
         val pendingIntent = PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
         alarmManager.cancel(pendingIntent)
-
-        if (remainingTarget <= 0) {
-            context.dataStore.edit { it[repo.NEXT_ALARM_KEY] = 0L }
-            return@launch 
-        }
 
         val now = Calendar.getInstance()
         val nowMins = (now.get(Calendar.HOUR_OF_DAY) * 60) + now.get(Calendar.MINUTE)
-        var effectiveSleepMins = sleepMins
-        if (sleepMins <= wakeMins) effectiveSleepMins += (24 * 60)
-        
-        val remainingMinutes = effectiveSleepMins - nowMins
-        if (remainingMinutes <= 0) {
-            context.dataStore.edit { it[repo.NEXT_ALARM_KEY] = 0L }
+
+        val isActive = if (wakeMins < sleepMins) {
+            nowMins in wakeMins until sleepMins
+        } else {
+            nowMins >= wakeMins || nowMins < sleepMins
+        }
+
+        // Bridge Alarm: Wakes the app up tomorrow morning
+        fun scheduleForWakeTime() {
+            val nextWakeCal = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, wakeMins / 60)
+                set(Calendar.MINUTE, wakeMins % 60)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            if (now.timeInMillis >= nextWakeCal.timeInMillis) {
+                nextWakeCal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+            CoroutineScope(Dispatchers.IO).launch {
+                context.dataStore.edit { it[repo.NEXT_ALARM_KEY] = nextWakeCal.timeInMillis }
+            }
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextWakeCal.timeInMillis, pendingIntent)
+        }
+
+        if (!isActive || remainingTarget <= 0) {
+            NotificationHelper.clearAll(context)
+            scheduleForWakeTime()
             return@launch
         }
 
-        // Apply native human biological limit (Max 1000ml per hour)
-        val maxSafeIncrementsPerHour = 4 // 4 x 250ml = 1000ml
-        val hoursRemaining = remainingMinutes / 60.0
+        // --- Active Hours Biological Math ---
+        var minsUntilSleep = sleepMins - nowMins
+        if (minsUntilSleep <= 0) minsUntilSleep += 24 * 60
+
+        val maxSafeIncrementsPerHour = 4 // Limit 1000ml per hour to avoid spamming
+        val hoursRemaining = minsUntilSleep / 60.0
         val maxSafeRemaining = (hoursRemaining * maxSafeIncrementsPerHour).toInt()
         
         var incrementsNeeded = ceil(remainingTarget / 250.0).toInt()
-        
-        // If user is too far behind, adapt schedule to safe limits rather than spamming
-        if (incrementsNeeded > maxSafeRemaining) {
-            incrementsNeeded = maxSafeRemaining
-        }
-        
-        if (incrementsNeeded <= 0) return@launch
+        if (incrementsNeeded > maxSafeRemaining) incrementsNeeded = maxSafeRemaining
+        if (incrementsNeeded <= 0) incrementsNeeded = 1 
 
-        val intervalMillis = (remainingMinutes * 60 * 1000L) / incrementsNeeded
+        val intervalMillis = (minsUntilSleep * 60 * 1000L) / incrementsNeeded
         val nextAlarmTime = System.currentTimeMillis() + intervalMillis
         
-        // Save next schedule for UI
         context.dataStore.edit { it[repo.NEXT_ALARM_KEY] = nextAlarmTime }
-
         alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextAlarmTime, pendingIntent)
     }
 }
 
 // --- Notification Helpers & Receivers ---
-class NotificationHelper {
-    companion object { 
-        const val CHANNEL_ID = "water_channel"
-        const val NOTIFICATION_ID = 101 
-        
-        fun clearAll(context: Context) {
-            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.cancel(NOTIFICATION_ID)
-            
-            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val nagIntent = Intent(context, NagReceiver::class.java)
-            val nagPending = PendingIntent.getBroadcast(context, 4, nagIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            alarmManager.cancel(nagPending)
-        }
-    }
-}
-
-class RescheduleReceiver : BroadcastReceiver() { 
-    override fun onReceive(context: Context, intent: Intent) { 
+object NotificationHelper {
+    const val CHANNEL_ID = "water_channel"
+    const val NOTIFICATION_ID = 101 
+    
+    fun clearAll(context: Context) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(NotificationHelper.CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_HIGH)
+        manager.cancel(NOTIFICATION_ID)
+        
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val nagIntent = Intent(context, NagReceiver::class.java)
+        val nagPending = PendingIntent.getBroadcast(context, 4, nagIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        alarmManager.cancel(nagPending)
+    }
+
+    fun showWaterNotification(context: Context) {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_HIGH)
         manager.createNotificationChannel(channel)
 
         val logIntent = Intent(context, LogWaterReceiver::class.java)
         val logPending = PendingIntent.getBroadcast(context, 2, logIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        
-        // NEW: Snooze Action
+        val dismissIntent = Intent(context, DismissReceiver::class.java)
+        val dismissPending = PendingIntent.getBroadcast(context, 3, dismissIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val snoozeIntent = Intent(context, SnoozeReceiver::class.java)
         val snoozePending = PendingIntent.getBroadcast(context, 5, snoozeIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
-        val builder = NotificationCompat.Builder(context, NotificationHelper.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Hydration Time! \uD83D\uDCA7")
             .setContentText("Drink 250ml. Don't ignore this!")
@@ -271,31 +277,60 @@ class RescheduleReceiver : BroadcastReceiver() {
             .setCategory(NotificationCompat.CATEGORY_ALARM) 
             .addAction(android.R.drawable.ic_input_add, "Log 250ml", logPending)
             .addAction(android.R.drawable.ic_popup_reminder, "Snooze 10m", snoozePending)
+            .setDeleteIntent(dismissPending)
             .setOngoing(true) 
             .setAutoCancel(false) 
         
-        manager.notify(NotificationHelper.NOTIFICATION_ID, builder.build())
+        val notification = builder.build()
+        notification.flags = notification.flags or Notification.FLAG_INSISTENT
+        manager.notify(NOTIFICATION_ID, notification)
+    }
+}
 
-        // NEW: Start the 30-second Nag Loop
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val nagIntent = Intent(context, NagReceiver::class.java)
-        val nagPending = PendingIntent.getBroadcast(context, 4, nagIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager.canScheduleExactAlarms()) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 30000, nagPending)
+// NEW: Clock-Aware Receiver
+class RescheduleReceiver : BroadcastReceiver() { 
+    override fun onReceive(context: Context, intent: Intent) { 
+        CoroutineScope(Dispatchers.IO).launch {
+            val repo = WaterRepository(context)
+            val prefs = repo.preferencesFlow.first()
+            val wakeMins = prefs[repo.WAKE_MINS_KEY] ?: 480
+            val sleepMins = prefs[repo.SLEEP_MINS_KEY] ?: 1320
+
+            val now = Calendar.getInstance()
+            val nowMins = (now.get(Calendar.HOUR_OF_DAY) * 60) + now.get(Calendar.MINUTE)
+
+            val isActive = if (wakeMins < sleepMins) {
+                nowMins in wakeMins until sleepMins
+            } else {
+                nowMins >= wakeMins || nowMins < sleepMins
+            }
+
+            if (isActive) {
+                NotificationHelper.showWaterNotification(context)
+                
+                // Start 30s Nag Loop ONLY if active
+                val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val nagIntent = Intent(context, NagReceiver::class.java)
+                val nagPending = PendingIntent.getBroadcast(context, 4, nagIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager.canScheduleExactAlarms()) {
+                    alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 30000, nagPending)
+                }
+            } else {
+                // Past bedtime -> stop looping, bridge to tomorrow morning
+                NotificationHelper.clearAll(context)
+                rescheduleSmartAlarms(context)
+            }
         }
     } 
 }
 
-// NEW: Beeps again if ignored
 class NagReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        // Just trigger the receiver again, which posts the notification and schedules the next nag
         val rescheduleIntent = Intent(context, RescheduleReceiver::class.java)
         context.sendBroadcast(rescheduleIntent)
     }
 }
 
-// NEW: Handles 10 min snooze
 class SnoozeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         NotificationHelper.clearAll(context)
@@ -303,18 +338,25 @@ class SnoozeReceiver : BroadcastReceiver() {
         val rescheduleIntent = Intent(context, RescheduleReceiver::class.java)
         val pendingIntent = PendingIntent.getBroadcast(context, 1, rescheduleIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager.canScheduleExactAlarms()) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 600000, pendingIntent) // 10 mins
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 600000, pendingIntent) 
         }
         Toast.makeText(context, "Snoozed for 10 minutes", Toast.LENGTH_SHORT).show()
     }
 }
 
+class DismissReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) return
+        val rescheduleIntent = Intent(context, RescheduleReceiver::class.java)
+        val pendingIntent = PendingIntent.getBroadcast(context, 1, rescheduleIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 30000, pendingIntent)
+    }
+}
+
 class LogWaterReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        CoroutineScope(Dispatchers.IO).launch {
-            WaterRepository(context).addLog(250)
-            // clearAll() is now handled inside addLog()
-        }
+        CoroutineScope(Dispatchers.IO).launch { WaterRepository(context).addLog(250) }
     }
 }
 
@@ -331,15 +373,10 @@ class MainActivity : ComponentActivity() {
 fun AppRouter(repo: WaterRepository) {
     val prefs by repo.preferencesFlow.collectAsState(initial = null)
     val isSetupComplete = prefs?.get(repo.SETUP_COMPLETE_KEY) ?: false
-
     if (prefs == null) return 
 
     PermissionGate {
-        if (!isSetupComplete) {
-            SetupWizardScreen(repo)
-        } else {
-            MainAppScreen(repo, prefs!!)
-        }
+        if (!isSetupComplete) { SetupWizardScreen(repo) } else { MainAppScreen(repo, prefs!!) }
     }
 }
 
@@ -347,10 +384,7 @@ fun AppRouter(repo: WaterRepository) {
 fun PermissionGate(content: @Composable () -> Unit) {
     val context = LocalContext.current
     val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-    
-    var hasNotificationPermission by remember { 
-        mutableStateOf(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED else true) 
-    }
+    var hasNotificationPermission by remember { mutableStateOf(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED else true) }
     var hasAlarmPermission by remember { mutableStateOf(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) alarmManager.canScheduleExactAlarms() else true) }
 
     val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted -> hasNotificationPermission = isGranted }
@@ -369,9 +403,7 @@ fun PermissionGate(content: @Composable () -> Unit) {
                 Spacer(modifier = Modifier.height(8.dp))
             }
             if (!hasAlarmPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                Button(onClick = { 
-                    context.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}")))
-                }, modifier = Modifier.fillMaxWidth()) { Text("Allow Exact Alarms") }
+                Button(onClick = { context.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))) }, modifier = Modifier.fillMaxWidth()) { Text("Allow Exact Alarms") }
             }
         }
     } else { content() }
@@ -453,8 +485,7 @@ fun HomeTab(repo: WaterRepository, currentIntake: Int, target: Int, useOz: Boole
     val displayTarget = if (useOz) (target * 0.033814).toInt() else target
     val unit = if (useOz) "oz" else "ml"
 
-    // NEW: Format Next Schedule string
-    val nextScheduleText = if (currentIntake >= target) "Goal Met! Great Job!" 
+    val nextScheduleText = if (currentIntake >= target) "Goal Met! Sleep well tonight." 
         else if (nextAlarmTime == 0L) "Calculating schedule..." 
         else "Next glass due at: ${SimpleDateFormat("h:mm a", Locale.getDefault()).format(nextAlarmTime)}"
 
@@ -473,7 +504,6 @@ fun HomeTab(repo: WaterRepository, currentIntake: Int, target: Int, useOz: Boole
         }
         
         Spacer(modifier = Modifier.height(24.dp))
-        // NEW: Display the schedule
         Text(nextScheduleText, fontWeight = FontWeight.Medium, color = Color.DarkGray)
         Spacer(modifier = Modifier.height(24.dp))
         
@@ -485,14 +515,11 @@ fun HomeTab(repo: WaterRepository, currentIntake: Int, target: Int, useOz: Boole
     }
 }
 
-// NEW: Advanced Chat UI
 @Composable
 fun AIChatTab(apiKey: String, allLogs: List<LogEntry>) {
     val coroutineScope = rememberCoroutineScope()
     var userInput by remember { mutableStateOf("") }
     var isThinking by remember { mutableStateOf(false) }
-    
-    // Maintain Chat History
     val chatHistory = remember { mutableStateListOf(ChatMessage("Hello! Ask me questions about your hydration data.", false)) }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
